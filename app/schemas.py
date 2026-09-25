@@ -118,6 +118,54 @@ class EntityLinksRequest(AlignRequest):
     )
 
 
+class SourceAnnotation(BaseModel):
+    """旧版修订稿上的一条批注：唯一 ID 与非空半开字符区间 [start, end)。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    annotation_id: str = Field(..., min_length=1, description="批注唯一标识")
+    start: StrictInt = Field(
+        ..., description="批注在旧修订文本中的起始字符下标（从 0 开始，含该位置）")
+    end: StrictInt = Field(
+        ..., description="批注在旧修订文本中的结束字符下标（不含该位置，须大于 start）")
+
+
+class AnnotationMigrateRequest(AlignRequest):
+    """旧版修订稿与批注，外加沿用 /align 输入的新版修订稿与识别时间轴。
+
+    recognized / total_duration / revised_text 描述新版修订稿（与 /align 相同）；
+    old_revised_text 为旧版修订文本，annotations 为其上的 1～100 条批注。
+    """
+
+    old_revised_text: str = Field(..., description="旧版人工修订完整文本")
+    annotations: list[SourceAnnotation] = Field(
+        ..., min_length=1, max_length=100,
+        description="旧稿批注列表（1～100 条）；ID 唯一、区间非空且不得越界",
+    )
+
+
+class AnnotationMigration(BaseModel):
+    annotation_id: str = Field(..., description="批注 ID（与请求一致）")
+    status: str = Field(
+        ...,
+        description="complete=区间内字符全部存活；partial=部分存活；orphan=无存活字符",
+    )
+    original_start: int = Field(
+        ..., description="批注在旧修订文本中的原起始下标（半开区间，含该位置）")
+    original_end: int = Field(
+        ..., description="批注在旧修订文本中的原结束下标（不含该位置）")
+    start_index: int | None = Field(
+        ..., description="迁移后在新修订文本中的起始下标（半开区间）；orphan 时为 null")
+    end_index: int | None = Field(
+        ..., description="迁移后在新修订文本中的结束下标（不含）；orphan 时为 null")
+    text: str | None = Field(
+        ..., description="迁移后对应的新稿片段；orphan 时为 null")
+    start: int | None = Field(
+        ..., description="新稿片段首字符起始毫秒；orphan 时为 null")
+    end: int | None = Field(
+        ..., description="新稿片段末字符结束毫秒；orphan 时为 null")
+
+
 class RevisedCharTimeline(BaseModel):
     char: str = Field(..., description="修订文本中的字符")
     start: int = Field(..., description="起始时间（毫秒）")

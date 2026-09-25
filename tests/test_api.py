@@ -1492,3 +1492,265 @@ def test_entity_links_entity_extra_field_rejected(client):
         "bucket_ms": 1000})
     assert r.status_code == 422
     assert "不允许" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# 批注迁移 POST /annotation-migrate
+# ---------------------------------------------------------------------------
+def _annotation_migrate(client, items, new_text, old_text, annotations,
+                        total=1000):
+    payload = {
+        "recognized": rc(items),
+        "total_duration": total,
+        "revised_text": new_text,
+        "old_revised_text": old_text,
+        "annotations": annotations,
+    }
+    return client.post("/annotation-migrate", json=payload)
+
+
+def _ann(aid, start, end):
+    return {"annotation_id": aid, "start": start, "end": end}
+
+
+def test_annotation_migrate_complete_with_internal_insertion(client):
+    # 旧稿“你好世界” → 新稿“你好呀世界”：“呀”为新增字符。
+    items = [
+        ("你", 0, 100), ("好", 200, 300), ("世", 500, 600),
+        ("界", 700, 800),
+    ]
+    r = _annotation_migrate(client, items, "你好呀世界", "你好世界", [
+        _ann("a", 0, 2),    # “你好”：全部存活，内部无新增
+        _ann("b", 1, 3),    # “好世”：存活，中间夹着新增“呀”，一并纳入
+        _ann("c", 2, 4),    # “世界”：全部存活
+    ])
+    assert r.status_code == 200, r.text
+    assert r.json() == [
+        {"annotation_id": "a", "status": "complete",
+         "original_start": 0, "original_end": 2,
+         "start_index": 0, "end_index": 2, "text": "你好",
+         "start": 0, "end": 300},
+        {"annotation_id": "b", "status": "complete",
+         "original_start": 1, "original_end": 3,
+         "start_index": 1, "end_index": 4, "text": "好呀世",
+         "start": 200, "end": 600},
+        {"annotation_id": "c", "status": "complete",
+         "original_start": 2, "original_end": 4,
+         "start_index": 3, "end_index": 5, "text": "世界",
+         "start": 500, "end": 800},
+    ]
+
+
+def test_annotation_migrate_partial_and_orphan(client):
+    # 旧稿“你好吗世界” → 新稿“你好呀世界”：吗被删、呀为替换“吗”的新增。
+    items = [
+        ("你", 0, 100), ("好", 200, 300), ("世", 500, 600),
+        ("界", 700, 800),
+    ]
+    r = _annotation_migrate(client, items, "你好呀世界", "你好吗世界", [
+        _ann("partial", 1, 4),  # “好吗世”：吗死亡，好/世存活
+        _ann("orphan", 2, 3),   # “吗”：无存活
+        _ann("whole", 0, 5),    # 全段：仅吗死亡
+    ])
+    assert r.status_code == 200, r.text
+    assert r.json() == [
+        {"annotation_id": "partial", "status": "partial",
+         "original_start": 1, "original_end": 4,
+         "start_index": 1, "end_index": 4, "text": "好呀世",
+         "start": 200, "end": 600},
+        {"annotation_id": "orphan", "status": "orphan",
+         "original_start": 2, "original_end": 3,
+         "start_index": None, "end_index": None, "text": None,
+         "start": None, "end": None},
+        {"annotation_id": "whole", "status": "partial",
+         "original_start": 0, "original_end": 5,
+         "start_index": 0, "end_index": 5, "text": "你好呀世界",
+         "start": 0, "end": 800},
+    ]
+
+
+def test_annotation_migrate_substitution_char_is_not_survivor(client):
+    # 旧稿含“错”，新稿替换为“对”：替换不视为相同字符存活 → orphan
+    r = _annotation_migrate(
+        client, [("错", 0, 100)], "对", "错", [_ann("x", 0, 1)], total=200)
+    assert r.status_code == 200, r.text
+    assert r.json() == [{
+        "annotation_id": "x", "status": "orphan",
+        "original_start": 0, "original_end": 1,
+        "start_index": None, "end_index": None, "text": None,
+        "start": None, "end": None,
+    }]
+
+
+def test_annotation_migrate_outside_insertions_not_included(client):
+    # 旧稿“b” → 新稿“abc”：首尾新增字符不在存活字符覆盖区间内，不纳入
+    r = _annotation_migrate(
+        client, [("b", 400, 500)], "abc", "b", [_ann("b", 0, 1)])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body) == 1
+    assert body[0]["status"] == "complete"
+    assert (body[0]["start_index"], body[0]["end_index"]) == (1, 2)
+    assert body[0]["text"] == "b"
+    assert (body[0]["start"], body[0]["end"]) == (400, 500)
+
+
+def test_annotation_migrate_single_survivor_is_point_interval(client):
+    # 旧稿“axc” → 新稿“ac”：x 被删除；[0,2)“ax”仅 a 存活 → partial，
+    # 新区间收敛为单字 [0,1)；[1,3)“xc”同理收敛到 c。
+    r = _annotation_migrate(
+        client, [("a", 0, 100), ("x", 200, 300), ("c", 400, 500)],
+        "ac", "axc", [_ann("s", 0, 2), _ann("t", 1, 3)])
+    assert r.status_code == 200, r.text
+    first, second = r.json()
+    assert first["status"] == "partial"
+    assert (first["start_index"], first["end_index"]) == (0, 1)
+    assert first["text"] == "a"
+    assert second["status"] == "partial"
+    assert (second["start_index"], second["end_index"]) == (1, 2)
+    assert second["text"] == "c"
+    assert (second["start"], second["end"]) == (400, 500)
+
+
+def test_annotation_migrate_response_order_matches_request(client):
+    r = _annotation_migrate(
+        client, [("a", 0, 100), ("b", 200, 300)], "ab", "ab",
+        [_ann("z", 1, 2), _ann("a", 0, 1)])
+    assert r.status_code == 200, r.text
+    assert [item["annotation_id"] for item in r.json()] == ["z", "a"]
+
+
+def test_annotation_migrate_uses_computed_times_for_inserted_chars(client):
+    # 新增“呀”推算时间为 [300,500)，覆盖区间把它纳入时时间按新稿时间轴
+    r = _annotation_migrate(
+        client, [
+            ("你", 0, 100), ("好", 200, 300), ("世", 500, 600),
+            ("界", 700, 800),
+        ], "你好呀世界", "你好世界", [_ann("b", 1, 3)])
+    assert r.status_code == 200, r.text
+    item = r.json()[0]
+    assert item["text"] == "好呀世"
+    assert (item["start"], item["end"]) == (200, 600)
+
+
+def test_annotation_migrate_out_of_bounds_rejected(client):
+    # end 越界
+    r = _annotation_migrate(
+        client, [("a", 0, 100)], "a", "ab", [_ann("x", 1, 3)])
+    assert r.status_code == 422
+    assert "越界" in r.json()["detail"]
+    # start 越界（end == 长度合法，start 必须 < 长度）
+    r = _annotation_migrate(
+        client, [("a", 0, 100)], "a", "ab", [_ann("x", 2, 2)])
+    assert r.status_code == 422
+    assert "越界" in r.json()["detail"]
+
+
+def test_annotation_migrate_empty_interval_rejected(client):
+    r = _annotation_migrate(
+        client, [("a", 0, 100)], "a", "a", [_ann("x", 0, 0)])
+    assert r.status_code == 422
+    assert "非空半开区间" in r.json()["detail"]
+
+
+def test_annotation_migrate_negative_index_rejected(client):
+    r = _annotation_migrate(
+        client, [("a", 0, 100)], "a", "a", [_ann("x", -1, 1)])
+    assert r.status_code == 422
+    assert "负数" in r.json()["detail"]
+
+
+def test_annotation_migrate_duplicate_id_rejected(client):
+    r = _annotation_migrate(
+        client, [("a", 0, 100)], "a", "a",
+        [_ann("dup", 0, 1), _ann("dup", 0, 1)])
+    assert r.status_code == 422
+    assert "唯一" in r.json()["detail"]
+
+
+def test_annotation_migrate_empty_id_rejected(client):
+    r = client.post("/annotation-migrate", json={
+        "recognized": rc([("a", 0, 100)]),
+        "total_duration": 200,
+        "revised_text": "a",
+        "old_revised_text": "a",
+        "annotations": [{"annotation_id": "", "start": 0, "end": 1}]})
+    assert r.status_code == 422
+    assert "非空" in r.json()["detail"]
+
+
+def test_annotation_migrate_count_range(client):
+    none = client.post("/annotation-migrate", json={
+        "recognized": rc([("a", 0, 100)]),
+        "total_duration": 200,
+        "revised_text": "a",
+        "old_revised_text": "a",
+        "annotations": []})
+    assert none.status_code == 422
+    assert "1～100" in none.json()["detail"]
+
+    many = client.post("/annotation-migrate", json={
+        "recognized": rc([("a", 0, 100)]),
+        "total_duration": 200,
+        "revised_text": "a",
+        "old_revised_text": "a",
+        "annotations": [_ann(f"id{i}", 0, 1) for i in range(101)]})
+    assert many.status_code == 422
+    assert "1～100" in many.json()["detail"]
+
+    hundred = client.post("/annotation-migrate", json={
+        "recognized": rc([("a", 0, 100)]),
+        "total_duration": 200,
+        "revised_text": "a",
+        "old_revised_text": "a",
+        "annotations": [_ann(f"id{i}", 0, 1) for i in range(100)]})
+    assert hundred.status_code == 200, hundred.text
+    assert len(hundred.json()) == 100
+
+
+def test_annotation_migrate_missing_annotations_rejected(client):
+    r = client.post("/annotation-migrate", json={
+        "recognized": rc([("a", 0, 100)]),
+        "total_duration": 200,
+        "revised_text": "a",
+        "old_revised_text": "a"})
+    assert r.status_code == 422
+    assert "annotations" in r.json()["detail"]
+
+
+def test_annotation_migrate_extra_field_rejected(client):
+    r = client.post("/annotation-migrate", json={
+        "recognized": rc([("a", 0, 100)]),
+        "total_duration": 200,
+        "revised_text": "a",
+        "old_revised_text": "a",
+        "annotations": [_ann("x", 0, 1)],
+        "bogus": 1})
+    assert r.status_code == 422
+    assert "不允许" in r.json()["detail"]
+
+
+def test_annotation_migrate_wrong_type_index(client):
+    r = client.post("/annotation-migrate", json={
+        "recognized": rc([("a", 0, 100)]),
+        "total_duration": 200,
+        "revised_text": "a",
+        "old_revised_text": "a",
+        "annotations": [{"annotation_id": "x", "start": "0", "end": 1}]})
+    assert r.status_code == 422
+    assert "整数" in r.json()["detail"]
+
+
+def test_annotation_migrate_reuses_alignment_validation(client):
+    r = _annotation_migrate(
+        client, [("a", 300, 100)], "a", "a", [_ann("x", 0, 1)], total=500)
+    assert r.status_code == 422
+    assert "结束时间" in r.json()["detail"]
+
+
+def test_annotation_migrate_old_text_length_limited(client, monkeypatch):
+    monkeypatch.setattr("app.main.MAX_REVISED_LENGTH", 2)
+    r = _annotation_migrate(
+        client, [("a", 0, 100)], "ab", "abc", [_ann("x", 0, 1)])
+    assert r.status_code == 422
+    assert "旧修订文本长度" in r.json()["detail"]

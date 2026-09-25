@@ -8,12 +8,15 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import alignment
+from .annotation_migrate import migrate_annotations, validate_annotations
 from .captions import build_captions
 from .entity_links import build_entity_links, validate_entity_links
 from .errors import InvalidTimelineError
 from .schemas import (
     AlignRequest,
     AlignResponse,
+    AnnotationMigrateRequest,
+    AnnotationMigration,
     CaptionSegment,
     CaptionsRequest,
     EntityLinksRequest,
@@ -102,6 +105,8 @@ async def validation_handler(_request: Request,
                 messages.append("实体数量无效，允许范围为 2～20 个")
             elif loc.endswith("aliases"):
                 messages.append("每个实体的别名数量无效，允许范围为 1～5 个")
+            elif loc.endswith("annotations"):
+                messages.append("批注数量无效，允许范围为 1～100 条")
             else:
                 messages.append(f"字段 {loc} 无效")
         elif etype == "extra_forbidden":
@@ -215,3 +220,21 @@ async def entity_links(req: EntityLinksRequest) -> EntityLinksResponse:
     timeline = build_timeline(req, alignment.backend_name())
     return build_entity_links(
         req.revised_text, timeline["chars"], req.entities, req.bucket_ms)
+
+
+@app.post(
+    "/annotation-migrate",
+    response_model=list[AnnotationMigration],
+    tags=["批注迁移"],
+)
+async def annotation_migrate(
+        req: AnnotationMigrateRequest) -> list[AnnotationMigration]:
+    """把旧版修订稿上的批注按全局顺序对齐迁移到新版修订稿。"""
+    validate_request(req, MAX_RECOGNIZED_CHARS, MAX_REVISED_LENGTH)
+    if len(req.old_revised_text) > MAX_REVISED_LENGTH:
+        raise InvalidTimelineError(
+            f"旧修订文本长度 {len(req.old_revised_text)} 超过上限 "
+            f"{MAX_REVISED_LENGTH}，可通过环境变量 MAX_REVISED_LENGTH 调整")
+    validate_annotations(req)
+    timeline = build_timeline(req, alignment.backend_name())
+    return migrate_annotations(req, timeline["chars"])

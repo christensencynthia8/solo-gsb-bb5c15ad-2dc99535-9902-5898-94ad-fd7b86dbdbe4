@@ -17,6 +17,7 @@
 - 支持 `POST /speaker-turns`：复用校时输入与逐字时间轴，按重叠时长把每个修订字符归属到说话人轮次并合并成块。
 - 支持 `POST /retime`：在 `/align` 的逐字时间轴上，按 1～20 个校准点做分段线性重映射，校正整体语速偏差。
 - 支持 `POST /entity-links`：复用校时输入与逐字时间轴，按实体别名精确命中与时间桶生成采访对象的共提及关系（边权 = 共同出现的桶数）。
+- 支持 `POST /annotation-migrate`：对旧版修订文本与新版修订稿做全局顺序对齐，把旧稿上的批注（唯一 ID + 半开字符区间）按相同字符的匹配关系迁移到新稿，标注 complete/partial/orphan 并给出新稿片段时间。
 - 提供 `/health` 健康检查。
 - 对齐内核为 **C（ctypes 调用）**，无编译器时自动回退**纯 Python** 实现，二者算法一致。
 
@@ -28,7 +29,8 @@
 docker compose up --build -d
 ```
 
-启动后（首次会构建镜像并在**容器启动时安装 Python 依赖**）：
+启动后（首次会构建镜像并在**容器启动时安装 Python 依赖**），API 监听
+**本地 8000 端口**：
 
 - API 地址：`http://localhost:8000`
 - 健康检查：`GET http://localhost:8000/health`
@@ -39,6 +41,7 @@ docker compose up --build -d
 - 字幕切分接口：`POST http://localhost:8000/captions`
 - 说话人轮次归属接口：`POST http://localhost:8000/speaker-turns`
 - 实体共提及接口：`POST http://localhost:8000/entity-links`
+- 批注迁移接口：`POST http://localhost:8000/annotation-migrate`
 - 交互式文档：`http://localhost:8000/docs`（OpenAPI：`/openapi.json`）
 
 停止：
@@ -546,6 +549,78 @@ curl -X POST http://localhost:8000/entity-links \
   较小者在先）；`weight` 为两实体共同出现的时间桶数量；`buckets` 为共同出现的
   桶下标（升序）。没有共现时返回 `[]`。
 
+### `POST /annotation-migrate`
+
+把**旧版修订稿上的批注**迁移到**新版修订稿**。新版修订稿沿用 `/align` 的全部
+输入（`recognized` / `total_duration` / `revised_text`，并执行完全相同的输入
+校验与逐字校时），另加旧稿文本与批注：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `old_revised_text` | 字符串 | 旧版人工修订完整文本（长度上限同 `MAX_REVISED_LENGTH`） |
+| `annotations` | 数组 | 旧稿批注列表，数量 `1～100` |
+| `annotations[].annotation_id` | 字符串 | 批注**唯一**标识，非空 |
+| `annotations[].start` | 整数 | 批注在旧稿中的起始字符下标（从 0 开始，含该位置） |
+| `annotations[].end` | 整数 | 批注在旧稿中的结束下标（**不含**；须 `start < end` 且不越界） |
+
+迁移规则：
+
+1. 对旧稿与新稿做与校时相同的**全局最少编辑代价对齐**；旧稿字符仅当被对齐到
+   **相同字符**（替换纠错不算）时视为“存活”。
+2. 迁移区间取批注区间内**仍存活字符在新稿中的最小覆盖区间**
+   `[最小新下标, 最大新下标 + 1)`，存活字符之间的**新增字符一并纳入**
+   （存活区间外侧的新增字符不纳入）。
+3. 状态：区间内字符**全部存活**为 `complete`；**部分存活**为 `partial`；
+   **无存活**为 `orphan`。
+4. 片段首末毫秒取新稿逐字时间轴：首字符的 `start`、末字符的 `end`
+   （新增字符使用其空档推算时间）。`orphan` 的新区间、`text` 与时间均为 `null`。
+5. 批注越界（`end > len(old_revised_text)` 等）、区间非空要求不满足或 ID 重复
+   返回 **422** 中文原因。结果顺序与请求中的批注顺序一致。
+
+示例：
+
+```bash
+curl -X POST http://localhost:8000/annotation-migrate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "recognized": [
+      {"char":"你","start":0,"end":100},
+      {"char":"好","start":200,"end":300},
+      {"char":"世","start":500,"end":600},
+      {"char":"界","start":700,"end":800}
+    ],
+    "total_duration": 1000,
+    "revised_text": "你好呀世界",
+    "old_revised_text": "你好世界",
+    "annotations": [
+      {"annotation_id":"c1","start":1,"end":3},
+      {"annotation_id":"c2","start":0,"end":2},
+      {"annotation_id":"c3","start":2,"end":4}
+    ]
+  }'
+```
+
+响应（旧区间 `[1,3)`“好世”的存活字符之间夹着新增“呀”，新区间把它一并纳入）：
+
+```json
+[
+  {"annotation_id":"c1","status":"complete","original_start":1,"original_end":3,
+   "start_index":1,"end_index":4,"text":"好呀世","start":200,"end":600},
+  {"annotation_id":"c2","status":"complete","original_start":0,"original_end":2,
+   "start_index":0,"end_index":2,"text":"你好","start":0,"end":300},
+  {"annotation_id":"c3","status":"complete","original_start":2,"original_end":4,
+   "start_index":3,"end_index":5,"text":"世界","start":500,"end":800}
+]
+```
+
+若旧稿中的被批注字符在新稿里被删除（或被替换为不同字符），对应批注为
+`orphan`，新位置与时间为 `null`：
+
+```json
+{"annotation_id":"orphan","status":"orphan","original_start":2,"original_end":3,
+ "start_index":null,"end_index":null,"text":null,"start":null,"end":null}
+```
+
 ### 输入校验（HTTP 422）
 
 例如 `end < start`：
@@ -562,7 +637,8 @@ curl -X POST http://localhost:8000/entity-links \
 `/speaker-turns` 的 `speaker_id` 为空或轮次为负时间、起止倒置、越界、
 未按起始时间排序或区间重叠、`/entity-links` 的实体数量不在 2～20、
 实体 ID 为空或重复、别名数量不在 1～5、别名为空或全局重复、
-`bucket_ms` 不在 1000～60000 等。
+`bucket_ms` 不在 1000～60000、`/annotation-migrate` 的批注数量不在 1～100、
+批注 ID 为空或重复、字符区间为空/下标为负/越界等。
 
 ---
 
@@ -617,6 +693,7 @@ app/
   captions.py        字幕切分（段数最少 → 断点总分最高 → 字典序最小）
   speaker.py         说话人轮次归属（按重叠时长最大 → 较早轮次）与相邻同归属合并
   entity_links.py    实体共提及（别名精确命中最优选择、时间桶归集与共现边权）
+  annotation_migrate.py  批注迁移（旧→新全局对齐、存活字符最小覆盖区间）
   alignment.py       内核加载（C → 即时编译 → 纯 Python）
   align_py.py        纯 Python 后备内核
   native/align_c.c   C 对齐内核源码
