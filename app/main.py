@@ -8,12 +8,15 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import alignment
+from .annotation import build_annotation_migrations, validate_annotations
 from .captions import build_captions
 from .entity_links import build_entity_links, validate_entity_links
 from .errors import InvalidTimelineError
 from .schemas import (
     AlignRequest,
     AlignResponse,
+    AnnotationMigrateRequest,
+    AnnotationMigration,
     CaptionSegment,
     CaptionsRequest,
     EntityLinksRequest,
@@ -77,6 +80,8 @@ async def validation_handler(_request: Request,
         elif etype in ("int_type", "int_parsing"):
             if loc.endswith(("max_edits", "max_chars")):
                 messages.append(f"字段 {loc} 必须是整数")
+            elif loc.endswith(("start_index", "end_index")):
+                messages.append(f"字段 {loc} 必须是整数字符下标")
             else:
                 messages.append(f"字段 {loc} 必须是整数毫秒时间戳")
         elif etype == "string_type":
@@ -102,6 +107,8 @@ async def validation_handler(_request: Request,
                 messages.append("实体数量无效，允许范围为 2～20 个")
             elif loc.endswith("aliases"):
                 messages.append("每个实体的别名数量无效，允许范围为 1～5 个")
+            elif loc.endswith("annotations"):
+                messages.append("批注数量无效，允许范围为 1～100 条")
             else:
                 messages.append(f"字段 {loc} 无效")
         elif etype == "extra_forbidden":
@@ -215,3 +222,22 @@ async def entity_links(req: EntityLinksRequest) -> EntityLinksResponse:
     timeline = build_timeline(req, alignment.backend_name())
     return build_entity_links(
         req.revised_text, timeline["chars"], req.entities, req.bucket_ms)
+
+
+@app.post(
+    "/annotation-migrate",
+    response_model=list[AnnotationMigration],
+    tags=["批注迁移"],
+)
+async def annotation_migrate(
+        req: AnnotationMigrateRequest) -> list[AnnotationMigration]:
+    """按旧新修订文本的全局对齐，把旧稿批注迁移到新版修订稿。"""
+    validate_request(req, MAX_RECOGNIZED_CHARS, MAX_REVISED_LENGTH)
+    if len(req.old_text) > MAX_REVISED_LENGTH:
+        raise InvalidTimelineError(
+            f"旧版修订文本长度 {len(req.old_text)} 超过上限 {MAX_REVISED_LENGTH}，"
+            "可通过环境变量 MAX_REVISED_LENGTH 调整")
+    validate_annotations(req)
+    timeline = build_timeline(req, alignment.backend_name())
+    return build_annotation_migrations(
+        req.old_text, req.revised_text, timeline["chars"], req.annotations)

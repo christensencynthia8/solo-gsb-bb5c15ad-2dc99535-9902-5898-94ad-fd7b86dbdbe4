@@ -17,6 +17,7 @@
 - 支持 `POST /speaker-turns`：复用校时输入与逐字时间轴，按重叠时长把每个修订字符归属到说话人轮次并合并成块。
 - 支持 `POST /retime`：在 `/align` 的逐字时间轴上，按 1～20 个校准点做分段线性重映射，校正整体语速偏差。
 - 支持 `POST /entity-links`：复用校时输入与逐字时间轴，按实体别名精确命中与时间桶生成采访对象的共提及关系（边权 = 共同出现的桶数）。
+- 支持 `POST /annotation-migrate`：对旧版修订文本与新版修订稿做全局顺序对齐，按相同字符的匹配关系把旧稿批注区间迁移到新稿（complete/partial/orphan），并给出新稿片段的首末毫秒。
 - 提供 `/health` 健康检查。
 - 对齐内核为 **C（ctypes 调用）**，无编译器时自动回退**纯 Python** 实现，二者算法一致。
 
@@ -39,6 +40,7 @@ docker compose up --build -d
 - 字幕切分接口：`POST http://localhost:8000/captions`
 - 说话人轮次归属接口：`POST http://localhost:8000/speaker-turns`
 - 实体共提及接口：`POST http://localhost:8000/entity-links`
+- 批注迁移接口：`POST http://localhost:8000/annotation-migrate`
 - 交互式文档：`http://localhost:8000/docs`（OpenAPI：`/openapi.json`）
 
 停止：
@@ -546,6 +548,79 @@ curl -X POST http://localhost:8000/entity-links \
   较小者在先）；`weight` 为两实体共同出现的时间桶数量；`buckets` 为共同出现的
   桶下标（升序）。没有共现时返回 `[]`。
 
+### `POST /annotation-migrate`
+
+在执行与 `/align` 完全相同的输入校验和逐字校时后，对**旧版修订文本** `old_text`
+与**新版修订稿** `revised_text` 做**全局顺序对齐**（同一对齐内核），按
+**相同字符**的匹配关系把旧稿上的批注区间迁移到新稿：
+
+- 旧稿字符在新稿中仍有**相同字符**的匹配即视为**存活**；被删除或被**替换纠错**
+  （对齐锚定但字符不同）的旧字符都不算存活；
+- 每条批注的新区间取**仍存活字符在新稿中的最小覆盖区间**——从首个存活字符的
+  新位置到最后一个存活字符的新位置，**区间内部的新增字符一并纳入**；
+- 全部存活 → `complete`；部分存活 → `partial`；无存活 → `orphan`
+  （`orphan` 的新区间与时间均为 `null`）。
+
+请求体包含 `/align` 的全部字段（`revised_text` 为新版修订稿），另加：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `old_text` | 字符串 | 旧版修订文本（批注区间所在文本），默认长度不超过 20,000 字符 |
+| `annotations` | 数组 | 批注列表，数量 `1～100` |
+| `annotations[].annotation_id` | 字符串 | **非空**且**唯一**的批注标识 |
+| `annotations[].start_index` | 整数 | 批注在旧稿中的起始字符下标（从 0 开始，半开区间） |
+| `annotations[].end_index` | 整数 | 批注在旧稿中的结束字符下标（不含该位置），须大于 `start_index` |
+
+校验要求（不满足返回 **422** 中文原因）：批注数量 `1～100`；批注 ID 非空且
+互不重复；区间为旧稿上的**非空半开区间**
+（`0 <= start_index < end_index <= len(old_text)`，空区间或越界均返回 422）。
+
+示例（新稿把旧稿的“吗”修订为“呀”，其余字不变）：
+
+```bash
+curl -X POST http://localhost:8000/annotation-migrate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "recognized": [
+      {"char":"你","start":0,"end":100},
+      {"char":"好","start":200,"end":300},
+      {"char":"世","start":400,"end":500},
+      {"char":"界","start":600,"end":700}
+    ],
+    "total_duration": 1000,
+    "revised_text": "你好呀世界",
+    "old_text": "你好吗世界",
+    "annotations": [
+      {"annotation_id": "a1", "start_index": 1, "end_index": 3},
+      {"annotation_id": "a2", "start_index": 3, "end_index": 5},
+      {"annotation_id": "a3", "start_index": 2, "end_index": 3}
+    ]
+  }'
+```
+
+响应：
+
+```json
+[
+  {"annotation_id":"a1","status":"partial","old_start_index":1,"old_end_index":3,"new_start_index":1,"new_end_index":2,"start":200,"end":300},
+  {"annotation_id":"a2","status":"complete","old_start_index":3,"old_end_index":5,"new_start_index":3,"new_end_index":5,"start":400,"end":700},
+  {"annotation_id":"a3","status":"orphan","old_start_index":2,"old_end_index":3,"new_start_index":null,"new_end_index":null,"start":null,"end":null}
+]
+```
+
+字段说明：
+
+- 按**批注输入顺序**返回每条的迁移结果。
+- `status`：`complete`（全部存活）/ `partial`（部分存活）/ `orphan`（无存活）。
+- `old_start_index` / `old_end_index`：批注在旧稿中的原区间（半开）。
+- `new_start_index` / `new_end_index`：迁移后在新稿中的区间（半开）；
+  `orphan` 时为 `null`。若存活字符之间夹着新稿的新增字符，新增字符一并
+  纳入新区间（如旧稿“好世”在新稿“你好呀世界”中迁移为 `[1,4)` 即“好呀世”）。
+- `start` / `end`：新稿片段首字符时间轴的 `start`、末字符时间轴的 `end`
+  （毫秒）；`orphan` 时为 `null`。
+- 示例中“吗”被替换为“呀”（替换纠错不算存活），因此 a1 只有“好”存活
+  （`partial`，新区间 `[1,2)`），a3 无任何存活字符（`orphan`）。
+
 ### 输入校验（HTTP 422）
 
 例如 `end < start`：
@@ -562,7 +637,8 @@ curl -X POST http://localhost:8000/entity-links \
 `/speaker-turns` 的 `speaker_id` 为空或轮次为负时间、起止倒置、越界、
 未按起始时间排序或区间重叠、`/entity-links` 的实体数量不在 2～20、
 实体 ID 为空或重复、别名数量不在 1～5、别名为空或全局重复、
-`bucket_ms` 不在 1000～60000 等。
+`bucket_ms` 不在 1000～60000、`/annotation-migrate` 的批注数量不在 1～100、
+批注 ID 为空或重复、区间为空或越出旧版修订文本等。
 
 ---
 
@@ -617,6 +693,7 @@ app/
   captions.py        字幕切分（段数最少 → 断点总分最高 → 字典序最小）
   speaker.py         说话人轮次归属（按重叠时长最大 → 较早轮次）与相邻同归属合并
   entity_links.py    实体共提及（别名精确命中最优选择、时间桶归集与共现边权）
+  annotation.py      批注迁移（旧新文本全局对齐、存活字符最小覆盖区间与状态判定）
   alignment.py       内核加载（C → 即时编译 → 纯 Python）
   align_py.py        纯 Python 后备内核
   native/align_c.c   C 对齐内核源码

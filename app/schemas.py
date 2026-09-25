@@ -118,6 +118,32 @@ class EntityLinksRequest(AlignRequest):
     )
 
 
+class Annotation(BaseModel):
+    """单条批注：唯一 ID 与旧版修订文本上的非空半开字符区间。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    annotation_id: str = Field(..., min_length=1, description="唯一的批注标识")
+    start_index: StrictInt = Field(
+        ..., description="批注在旧版修订文本中的起始字符下标（从 0 开始，半开区间）"
+    )
+    end_index: StrictInt = Field(
+        ..., description="批注在旧版修订文本中的结束字符下标（不含该位置）"
+    )
+
+
+class AnnotationMigrateRequest(AlignRequest):
+    """校时输入（revised_text 为新版修订稿）与旧稿批注迁移参数。"""
+
+    old_text: str = Field(
+        ..., description="旧版修订文本（批注区间所在文本）"
+    )
+    annotations: list[Annotation] = Field(
+        ..., min_length=1, max_length=100,
+        description="批注列表（1～100 条）；ID 唯一，区间为旧稿上的非空半开区间",
+    )
+
+
 class RevisedCharTimeline(BaseModel):
     char: str = Field(..., description="修订文本中的字符")
     start: int = Field(..., description="起始时间（毫秒）")
@@ -221,3 +247,21 @@ class EntityLinksResponse(BaseModel):
         ..., description="互不重叠的实体别名命中，按原文顺序返回")
     edges: list[EntityLinkEdge] = Field(
         ..., description="共提及边（边权非零），按实体 ID 排序；无共现为空列表")
+
+
+class AnnotationMigration(BaseModel):
+    annotation_id: str = Field(..., description="批注 ID")
+    status: str = Field(
+        ..., description="complete=全部存活；partial=部分存活；orphan=无存活")
+    old_start_index: int = Field(
+        ..., description="批注在旧版修订文本中的起始字符下标（从 0 开始，半开区间）")
+    old_end_index: int = Field(
+        ..., description="批注在旧版修订文本中的结束字符下标（不含该位置）")
+    new_start_index: int | None = Field(
+        ..., description="迁移后在新稿中的起始字符下标；orphan 时为 null")
+    new_end_index: int | None = Field(
+        ..., description="迁移后在新稿中的结束字符下标（半开区间，不含）；orphan 时为 null")
+    start: int | None = Field(
+        ..., description="新稿片段首字符时间轴的 start（毫秒）；orphan 时为 null")
+    end: int | None = Field(
+        ..., description="新稿片段末字符时间轴的 end（毫秒）；orphan 时为 null")
